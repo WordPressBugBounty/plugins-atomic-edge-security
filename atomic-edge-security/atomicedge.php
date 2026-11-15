@@ -1,0 +1,260 @@
+<?php
+/**
+ * Plugin Name: Atomic Edge Security
+ * Plugin URI: https://atomicedge.io/wordpress
+ * Description: Connect your WordPress site to Atomic Edge WAF/CDN for advanced security protection, analytics, and access control management.
+ * Version: 2.9.4
+ * Requires at least: 5.8
+ * Requires PHP: 7.4
+ * Tested up to: 7.1
+ * Author: Atomic Edge
+ * Author URI: https://atomicedge.io
+ * License: GPL v2 or later
+ * License URI: https://www.gnu.org/licenses/gpl-2.0.html
+ * Text Domain: atomic-edge-security
+ * Domain Path: /languages
+ *
+ * GitHub Plugin URI: https://github.com/stardothosting/atomicedge-wordpress
+ * Primary Branch: main
+ * @package AtomicEdge
+ */
+
+// Prevent direct access.
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
+// Plugin constants.
+define( 'ATOMICEDGE_VERSION', '2.9.4' );
+define( 'ATOMICEDGE_PLUGIN_FILE', __FILE__ );
+define( 'ATOMICEDGE_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
+define( 'ATOMICEDGE_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
+define( 'ATOMICEDGE_PLUGIN_BASENAME', plugin_basename( __FILE__ ) );
+
+// Minimum requirements.
+define( 'ATOMICEDGE_MIN_PHP_VERSION', '7.4' );
+define( 'ATOMICEDGE_MIN_WP_VERSION', '5.8' );
+
+define( 'ATOMICEDGE_TESTED_UP_TO', '7.1' );
+
+/**
+ * Check minimum requirements before loading the plugin.
+ *
+ * @return bool True if requirements are met, false otherwise.
+ */
+function atomicedge_check_requirements() {
+	$errors = array();
+
+	// Check PHP version.
+	if ( version_compare( PHP_VERSION, ATOMICEDGE_MIN_PHP_VERSION, '<' ) ) {
+		$errors[] = sprintf(
+			/* translators: 1: Current PHP version, 2: Required PHP version */
+			esc_html__( 'Atomic Edge Security requires PHP %2$s or higher. You are running PHP %1$s.', 'atomic-edge-security' ),
+			esc_html( PHP_VERSION ),
+			esc_html( ATOMICEDGE_MIN_PHP_VERSION )
+		);
+	}
+
+	// Check WordPress version.
+	global $wp_version;
+	if ( version_compare( $wp_version, ATOMICEDGE_MIN_WP_VERSION, '<' ) ) {
+		$errors[] = sprintf(
+			/* translators: 1: Current WordPress version, 2: Required WordPress version */
+			esc_html__( 'Atomic Edge Security requires WordPress %2$s or higher. You are running WordPress %1$s.', 'atomic-edge-security' ),
+			esc_html( $wp_version ),
+			esc_html( ATOMICEDGE_MIN_WP_VERSION )
+		);
+	}
+
+	// Check for OpenSSL (required for API key encryption).
+	if ( ! function_exists( 'openssl_encrypt' ) ) {
+		$errors[] = esc_html__( 'Atomic Edge Security requires the OpenSSL PHP extension to be enabled.', 'atomic-edge-security' );
+	}
+
+	if ( ! empty( $errors ) ) {
+		add_action(
+			'admin_notices',
+			function () use ( $errors ) {
+				?>
+				<div class="notice notice-error">
+					<p><strong><?php esc_html_e( 'Atomic Edge Security cannot be activated:', 'atomic-edge-security' ); ?></strong></p>
+					<ul>
+						<?php foreach ( $errors as $error ) : ?>
+							<li><?php echo esc_html( $error ); ?></li>
+						<?php endforeach; ?>
+					</ul>
+				</div>
+				<?php
+			}
+		);
+		return false;
+	}
+
+	return true;
+}
+
+/**
+ * Initialize the plugin.
+ *
+ * @return void
+ */
+function atomicedge_init() {
+	// Load plugin translations.
+	load_plugin_textdomain( 'atomic-edge-security', false, dirname( ATOMICEDGE_PLUGIN_BASENAME ) . '/languages' );
+
+	// Check requirements.
+	if ( ! atomicedge_check_requirements() ) {
+		return;
+	}
+
+	// Include required files.
+	require_once ATOMICEDGE_PLUGIN_DIR . 'includes/class-atomicedge.php';
+	require_once ATOMICEDGE_PLUGIN_DIR . 'includes/class-atomicedge-api.php';
+	require_once ATOMICEDGE_PLUGIN_DIR . 'includes/class-atomicedge-dev-mode.php';
+	require_once ATOMICEDGE_PLUGIN_DIR . 'includes/class-atomicedge-admin.php';
+	require_once ATOMICEDGE_PLUGIN_DIR . 'includes/class-atomicedge-ajax.php';
+	require_once ATOMICEDGE_PLUGIN_DIR . 'includes/class-atomicedge-scanner.php';
+	require_once ATOMICEDGE_PLUGIN_DIR . 'includes/class-atomicedge-vulnerability-scanner.php';
+	require_once ATOMICEDGE_PLUGIN_DIR . 'includes/class-atomicedge-cron.php';
+
+	// CDN classes.
+	require_once ATOMICEDGE_PLUGIN_DIR . 'includes/class-atomicedge-cdn-rules.php';
+	require_once ATOMICEDGE_PLUGIN_DIR . 'includes/class-atomicedge-cdn-rewrite.php';
+	require_once ATOMICEDGE_PLUGIN_DIR . 'includes/class-atomicedge-cdn.php';
+
+	// Two-Factor Authentication classes.
+	require_once ATOMICEDGE_PLUGIN_DIR . 'includes/class-atomicedge-2fa-crypto.php';
+	require_once ATOMICEDGE_PLUGIN_DIR . 'includes/class-atomicedge-2fa-totp.php';
+	require_once ATOMICEDGE_PLUGIN_DIR . 'includes/class-atomicedge-2fa-backup.php';
+	require_once ATOMICEDGE_PLUGIN_DIR . 'includes/class-atomicedge-2fa-policy.php';
+	require_once ATOMICEDGE_PLUGIN_DIR . 'includes/class-atomicedge-2fa-audit.php';
+	require_once ATOMICEDGE_PLUGIN_DIR . 'includes/class-atomicedge-2fa.php';
+	require_once ATOMICEDGE_PLUGIN_DIR . 'includes/class-atomicedge-2fa-login.php';
+
+	// Initialize 2FA Audit system.
+	AtomicEdge_2FA_Audit::init();
+
+	// Load WP-CLI commands if available.
+	if ( defined( 'WP_CLI' ) && WP_CLI ) {
+		require_once ATOMICEDGE_PLUGIN_DIR . 'includes/class-atomicedge-cli.php';
+	}
+
+	// Initialize main plugin class.
+	AtomicEdge::get_instance();
+}
+add_action( 'plugins_loaded', 'atomicedge_init' );
+
+/**
+ * Install/upgrade database schema used by the malware scanner.
+ *
+ * @return void
+ */
+function atomicedge_install_scanner_schema() {
+	global $wpdb;
+
+	$table_name      = $wpdb->prefix . 'atomicedge_scan_queue';
+	$charset_collate = $wpdb->get_charset_collate();
+
+	require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+
+	$sql = "CREATE TABLE {$table_name} (
+		id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+		run_id char(36) NOT NULL,
+		item_type varchar(10) NOT NULL,
+		area varchar(20) NOT NULL DEFAULT '',
+		path longtext NOT NULL,
+		path_hash char(32) NOT NULL,
+		status varchar(20) NOT NULL DEFAULT 'pending',
+		meta longtext NULL,
+		last_error longtext NULL,
+		created_at datetime NOT NULL,
+		updated_at datetime NOT NULL,
+		PRIMARY KEY  (id),
+		KEY run_status (run_id,status,id),
+		KEY run_type_status (run_id,item_type,status,id),
+		UNIQUE KEY run_item (run_id,item_type,path_hash)
+	) {$charset_collate};";
+
+	dbDelta( $sql );
+}
+
+/**
+ * Plugin activation hook.
+ *
+ * @return void
+ */
+function atomicedge_activate() {
+	// Check requirements on activation.
+	if ( ! atomicedge_check_requirements() ) {
+		deactivate_plugins( ATOMICEDGE_PLUGIN_BASENAME );
+		wp_die(
+			esc_html__( 'AtomicEdge Security cannot be activated. Please check the requirements.', 'atomic-edge-security' ),
+			esc_html__( 'Plugin Activation Error', 'atomic-edge-security' ),
+			array( 'back_link' => true )
+		);
+	}
+
+	// Set default options.
+	$defaults = array(
+		'api_url'   => 'https://dashboard.atomicedge.io/api/v1',
+		'connected' => false,
+	);
+
+	foreach ( $defaults as $key => $value ) {
+		if ( false === get_option( 'atomicedge_' . $key ) ) {
+			add_option( 'atomicedge_' . $key, $value );
+		}
+	}
+
+	// Ensure scanner DB schema exists.
+	atomicedge_install_scanner_schema();
+
+	// Schedule cron events.
+	if ( ! wp_next_scheduled( 'atomicedge_daily_scan' ) ) {
+		wp_schedule_event( time(), 'daily', 'atomicedge_daily_scan' );
+	}
+
+	// Schedule CDN cache cleanup.
+	// Load Cron class if not already loaded (activation hook fires before plugins_loaded).
+	if ( ! class_exists( 'AtomicEdge_Cron' ) ) {
+		require_once ATOMICEDGE_PLUGIN_DIR . 'includes/class-atomicedge-cron.php';
+	}
+	AtomicEdge_Cron::schedule_cdn_cleanup();
+
+	// Flush rewrite rules.
+	flush_rewrite_rules();
+}
+register_activation_hook( __FILE__, 'atomicedge_activate' );
+
+/**
+ * Plugin deactivation hook.
+ *
+ * @return void
+ */
+function atomicedge_deactivate() {
+	// Clear scheduled events.
+	wp_clear_scheduled_hook( 'atomicedge_daily_scan' );
+	wp_clear_scheduled_hook( 'atomicedge_sync_settings' );
+	wp_clear_scheduled_hook( 'atomicedge_cdn_cache_cleanup' );
+
+	// Flush rewrite rules.
+	flush_rewrite_rules();
+}
+register_deactivation_hook( __FILE__, 'atomicedge_deactivate' );
+
+/**
+ * Add settings link to plugins page.
+ *
+ * @param array $links Existing plugin action links.
+ * @return array Modified plugin action links.
+ */
+function atomicedge_plugin_action_links( $links ) {
+	$settings_link = sprintf(
+		'<a href="%s">%s</a>',
+		esc_url( admin_url( 'admin.php?page=atomicedge' ) ),
+		esc_html__( 'Settings', 'atomic-edge-security' )
+	);
+	array_unshift( $links, $settings_link );
+	return $links;
+}
+add_filter( 'plugin_action_links_' . ATOMICEDGE_PLUGIN_BASENAME, 'atomicedge_plugin_action_links' );

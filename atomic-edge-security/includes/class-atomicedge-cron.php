@@ -1,0 +1,226 @@
+<?php
+/**
+ * AtomicEdge Cron Handler
+ *
+ * Manages scheduled tasks and background processes.
+ *
+ * @package AtomicEdge
+ */
+
+// Prevent direct access.
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
+/**
+ * Class AtomicEdge_Cron
+ *
+ * Handles scheduled tasks.
+ */
+class AtomicEdge_Cron {
+
+	/**
+	 * API client instance.
+	 *
+	 * @var AtomicEdge_API
+	 */
+	private $api;
+
+	/**
+	 * Scanner instance.
+	 *
+	 * @var AtomicEdge_Scanner
+	 */
+	private $scanner;
+
+	/**
+	 * Constructor.
+	 *
+	 * @param AtomicEdge_API     $api     API client instance.
+	 * @param AtomicEdge_Scanner $scanner Scanner instance.
+	 */
+	public function __construct( AtomicEdge_API $api, AtomicEdge_Scanner $scanner ) {
+		$this->api     = $api;
+		$this->scanner = $scanner;
+		$this->init_hooks();
+	}
+
+	/**
+	 * Initialize cron hooks.
+	 *
+	 * @return void
+	 */
+	private function init_hooks() {
+		// Daily scan.
+		add_action( 'atomicedge_daily_scan', array( $this, 'run_daily_scan' ) );
+
+		// Settings sync (hourly).
+		add_action( 'atomicedge_sync_settings', array( $this, 'sync_settings' ) );
+
+		// CDN cache cleanup (weekly).
+		add_action( 'atomicedge_cdn_cache_cleanup', array( $this, 'cleanup_cdn_cache' ) );
+
+		// Add custom cron schedule.
+		add_filter( 'cron_schedules', array( $this, 'add_cron_schedules' ) );
+	}
+
+	/**
+	 * Add custom cron schedules.
+	 *
+	 * @param array $schedules Existing schedules.
+	 * @return array Modified schedules.
+	 */
+	public function add_cron_schedules( $schedules ) {
+		$schedules['atomicedge_weekly'] = array(
+			'interval' => WEEK_IN_SECONDS,
+			'display'  => __( 'Once Weekly', 'atomic-edge-security' ),
+		);
+
+		return $schedules;
+	}
+
+	/**
+	 * Run daily malware scan.
+	 *
+	 * @return void
+	 */
+	public function run_daily_scan() {
+		AtomicEdge::log( 'Starting daily scan' );
+
+		$results = $this->scanner->run_full_scan();
+
+		if ( false === $results ) {
+			AtomicEdge::log( 'Daily scan failed' );
+			return;
+		}
+
+		// Check if there are issues.
+		$total_issues = $results['summary']['total_issues'] ?? 0;
+
+		if ( $total_issues > 0 ) {
+			// Log warning.
+			AtomicEdge::log( 'Daily scan found issues', array( 'count' => $total_issues ) );
+
+			// Optionally send notification.
+			// This could be expanded to send email notifications.
+			do_action( 'atomicedge_scan_issues_found', $results );
+		}
+
+		AtomicEdge::log( 'Daily scan completed', $results['summary'] );
+	}
+
+	/**
+	 * Sync settings with AtomicEdge API.
+	 *
+	 * @return void
+	 */
+	public function sync_settings() {
+		if ( ! $this->api->is_connected() ) {
+			return;
+		}
+
+		AtomicEdge::log( 'Syncing settings with Atomic Edge' );
+
+		// Refresh site info.
+		$site_info = $this->api->get_site_info();
+
+		if ( $site_info['success'] && isset( $site_info['data'] ) ) {
+			// Merge into existing site data to preserve CDN fields from refresh.
+			$existing = get_option( 'atomicedge_site_data', array() );
+			if ( ! is_array( $existing ) ) {
+				$existing = array();
+			}
+			update_option( 'atomicedge_site_data', array_merge( $existing, $site_info['data'] ) );
+			AtomicEdge::log( 'Settings sync completed' );
+		} else {
+			AtomicEdge::log( 'Settings sync failed', $site_info );
+		}
+	}
+
+	/**
+	 * Schedule the settings sync.
+	 *
+	 * @return void
+	 */
+	public static function schedule_sync() {
+		if ( ! wp_next_scheduled( 'atomicedge_sync_settings' ) ) {
+			wp_schedule_event( time(), 'hourly', 'atomicedge_sync_settings' );
+		}
+	}
+
+	/**
+	 * Unschedule all cron events.
+	 *
+	 * @return void
+	 */
+	public static function unschedule_all() {
+		wp_clear_scheduled_hook( 'atomicedge_daily_scan' );
+		wp_clear_scheduled_hook( 'atomicedge_sync_settings' );
+		wp_clear_scheduled_hook( 'atomicedge_cdn_cache_cleanup' );
+	}
+
+	/**
+	 * Cleanup old CDN cache files.
+	 *
+	 * Removes minified cache files older than 7 days to prevent
+	 * unlimited cache growth. Called weekly via cron.
+	 *
+	 * @return void
+	 */
+	public function cleanup_cdn_cache() {
+		if ( ! class_exists( 'AtomicEdge_CDN' ) ) {
+			return;
+		}
+
+		$cache_dir = AtomicEdge_CDN::get_cache_dir();
+		if ( ! is_dir( $cache_dir ) ) {
+			return;
+		}
+
+		$deleted     = 0;
+		$max_age     = 7 * DAY_IN_SECONDS;
+		$directories = array( 'css', 'js' );
+
+		foreach ( $directories as $dir ) {
+			$path = $cache_dir . '/' . $dir;
+			if ( ! is_dir( $path ) ) {
+				continue;
+			}
+
+			$files = glob( $path . '/*' );
+			if ( ! $files ) {
+				continue;
+			}
+
+			foreach ( $files as $file ) {
+				if ( ! is_file( $file ) ) {
+					continue;
+				}
+
+				// Check file age.
+				$file_age = time() - filemtime( $file );
+				if ( $file_age > $max_age ) {
+					// phpcs:ignore WordPress.WP.AlternativeFunctions.unlink_unlink
+					if ( unlink( $file ) ) {
+						++$deleted;
+					}
+				}
+			}
+		}
+
+		if ( $deleted > 0 ) {
+			AtomicEdge::log( 'CDN cache cleanup completed', array( 'deleted' => $deleted ) );
+		}
+	}
+
+	/**
+	 * Schedule the CDN cache cleanup.
+	 *
+	 * @return void
+	 */
+	public static function schedule_cdn_cleanup() {
+		if ( ! wp_next_scheduled( 'atomicedge_cdn_cache_cleanup' ) ) {
+			wp_schedule_event( time(), 'atomicedge_weekly', 'atomicedge_cdn_cache_cleanup' );
+		}
+	}
+}
