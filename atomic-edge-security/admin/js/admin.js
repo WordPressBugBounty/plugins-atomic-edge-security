@@ -761,6 +761,7 @@
 
             // Initialize pagination for results tables (works on both scanner pages)
             this.initScannerPagination();
+            this.initFindingsToolbar();
 
             // Malware scan button
             if ($('#atomicedge-run-scan').length > 0) {
@@ -1061,7 +1062,7 @@
             var $pagination = $section.find('.atomicedge-pagination');
             var perPage = $section.data('perPage');
             var totalPages = $section.data('totalPages');
-            var $rows = $table.find('tbody tr');
+            var $rows = $table.find('tbody tr').not('.atomicedge-finding-filtered');
             var totalRows = $rows.length;
             
             // Update current page
@@ -1091,6 +1092,218 @@
         },
 
         /**
+         * Severity ranks (higher is more severe). Mirrors AtomicEdge_Scanner::severity_rank().
+         */
+        severityRanks: { low: 1, medium: 2, high: 3, critical: 4 },
+
+        /**
+         * Visibility state of a finding: dismissed, open, or informational.
+         */
+        findingStateFor: function(rank, dismissed, thresholdRank) {
+            if (dismissed) {
+                return 'dismissed';
+            }
+            return rank >= thresholdRank ? 'open' : 'informational';
+        },
+
+        /**
+         * Whether a finding passes the status, severity, and keyword filters.
+         * Every whitespace-separated search word must appear in the finding text.
+         */
+        findingMatchesFilters: function(finding, filters) {
+            if (filters.status && filters.status !== 'all' && finding.state !== filters.status) {
+                return false;
+            }
+            if (filters.severity && filters.severity !== 'all' && finding.severity !== filters.severity) {
+                return false;
+            }
+            var words = String(filters.search || '').toLowerCase().split(/\s+/).filter(Boolean);
+            var text = String(finding.text || '');
+            return words.every(function(word) {
+                return text.indexOf(word) !== -1;
+            });
+        },
+
+        /**
+         * Comparator for findings. Severity sorts most severe first, then by file.
+         */
+        compareFindings: function(a, b, sortKey) {
+            var byText = function(x, y) {
+                return x < y ? -1 : (x > y ? 1 : 0);
+            };
+            if (sortKey === 'file') {
+                return byText(a.file, b.file) || (b.rank - a.rank);
+            }
+            if (sortKey === 'issue') {
+                return byText(a.issue, b.issue) || (b.rank - a.rank) || byText(a.file, b.file);
+            }
+            return (b.rank - a.rank) || byText(a.file, b.file);
+        },
+
+        /**
+         * Read a findings row into a plain object for filtering and sorting.
+         */
+        findingFromRow: function($row) {
+            return {
+                rank: parseInt($row.attr('data-rank'), 10) || 0,
+                state: $row.attr('data-state') || 'open',
+                severity: $row.attr('data-severity') || '',
+                file: $row.find('code').first().text(),
+                issue: $row.find('.atomicedge-finding-issue').text(),
+                text: $row.text().toLowerCase()
+            };
+        },
+
+        /**
+         * Sort and filter the findings table, then rebuild its pagination.
+         */
+        applyFindingFilters: function($section) {
+            var self = this;
+            var $toolbar = $section.find('.atomicedge-findings-toolbar');
+            var $tbody = $section.find('.atomicedge-paginated-table tbody');
+            var filters = {
+                search: $toolbar.find('.atomicedge-findings-search').val(),
+                severity: $toolbar.find('.atomicedge-findings-severity').val(),
+                status: $toolbar.find('.atomicedge-findings-status').val()
+            };
+            var sortKey = $toolbar.find('.atomicedge-findings-sort').val();
+
+            var entries = $tbody.find('tr.atomicedge-finding').map(function() {
+                var $row = $(this);
+                return { $row: $row, finding: self.findingFromRow($row) };
+            }).get();
+
+            entries.sort(function(a, b) {
+                return self.compareFindings(a.finding, b.finding, sortKey);
+            });
+
+            var visible = 0;
+            entries.forEach(function(entry) {
+                var show = self.findingMatchesFilters(entry.finding, filters);
+                entry.$row.toggleClass('atomicedge-finding-filtered', !show);
+                if (show) {
+                    visible++;
+                }
+                $tbody.append(entry.$row);
+            });
+
+            var counts = this.updateFindingCounts($section);
+            $toolbar.find('.atomicedge-findings-match-count').text(
+                visible + ' of ' + entries.length + ' shown · ' + counts.open + ' open · ' +
+                counts.informational + ' informational · ' + counts.dismissed + ' dismissed'
+            );
+
+            this.repaginateFindings($section);
+        },
+
+        /**
+         * Count findings by state and update the summary badge.
+         */
+        updateFindingCounts: function($section) {
+            var counts = { open: 0, informational: 0, dismissed: 0 };
+            $section.find('tbody tr.atomicedge-finding').each(function() {
+                var state = $(this).attr('data-state');
+                if (state === 'open') {
+                    counts.open++;
+                } else if (state === 'informational') {
+                    counts.informational++;
+                } else if (state === 'dismissed') {
+                    counts.dismissed++;
+                }
+            });
+            $('.atomicedge-suspicious-count').text(counts.open);
+            return counts;
+        },
+
+        /**
+         * Rebuild pagination over the rows that pass the current filters.
+         */
+        repaginateFindings: function($section) {
+            var $table = $section.find('.atomicedge-paginated-table');
+            var $pagination = $section.find('.atomicedge-pagination');
+            var perPage = parseInt($section.attr('data-per-page'), 10) || 10;
+            var totalRows = $table.find('tbody tr').not('.atomicedge-finding-filtered').length;
+            var totalPages = Math.max(1, Math.ceil(totalRows / perPage));
+
+            $section.data('perPage', perPage);
+            $section.data('totalPages', totalPages);
+            $section.data('currentPage', 1);
+
+            if (totalRows === 0) {
+                $pagination.html('<p class="atomicedge-no-findings">' + this.escapeHtml('No findings match the current filters.') + '</p>');
+                return;
+            }
+
+            this.buildPaginationUI($section, $pagination, totalRows, perPage, totalPages);
+            this.showPage($section, 1);
+        },
+
+        /**
+         * Bind toolbar filters, sorting, search, sensitivity, and dismiss/restore actions.
+         */
+        initFindingsToolbar: function() {
+            var self = this;
+            var $sections = $('.atomicedge-findings-toolbar').closest('[data-paginate="true"]');
+            if ($sections.length === 0) {
+                return;
+            }
+
+            $sections.each(function() {
+                self.applyFindingFilters($(this));
+            });
+
+            $(document).on('input change', '.atomicedge-findings-search, .atomicedge-findings-severity, .atomicedge-findings-status, .atomicedge-findings-sort', function() {
+                self.applyFindingFilters($(this).closest('[data-paginate="true"]'));
+            });
+
+            $(document).on('change', '.atomicedge-findings-sensitivity', function() {
+                var $select = $(this);
+                var $section = $select.closest('[data-paginate="true"]');
+                $select.prop('disabled', true);
+                self.ajax('atomicedge_save_scan_sensitivity', { level: $select.val() }, function(data) {
+                    var thresholdRank = self.severityRanks[data.threshold] || 2;
+                    $section.find('.atomicedge-findings-toolbar').attr('data-threshold-rank', thresholdRank);
+                    $section.find('tbody tr.atomicedge-finding').each(function() {
+                        var $row = $(this);
+                        var rank = parseInt($row.attr('data-rank'), 10) || 0;
+                        $row.attr('data-state', self.findingStateFor(rank, $row.attr('data-dismissed') === '1', thresholdRank));
+                    });
+                    $select.prop('disabled', false);
+                    self.applyFindingFilters($section);
+                }, function(err) {
+                    $select.prop('disabled', false);
+                    self.showNotice((err && err.message) || atomicedgeAdmin.strings.error, 'error');
+                });
+            });
+
+            $(document).on('click', '.atomicedge-dismiss-finding', function() {
+                var $button = $(this);
+                var $row = $button.closest('tr.atomicedge-finding');
+                var $section = $button.closest('[data-paginate="true"]');
+                var restoring = $row.attr('data-dismissed') === '1';
+                $button.prop('disabled', true);
+
+                self.ajax('atomicedge_update_scan_finding', {
+                    file: $button.attr('data-file'),
+                    sha256: $button.attr('data-sha256'),
+                    action_type: restoring ? 'restore' : 'dismiss',
+                    reason: ''
+                }, function() {
+                    var dismissed = !restoring;
+                    var rank = parseInt($row.attr('data-rank'), 10) || 0;
+                    var thresholdRank = parseInt($section.find('.atomicedge-findings-toolbar').attr('data-threshold-rank'), 10) || 2;
+                    $row.attr('data-dismissed', dismissed ? '1' : '0');
+                    $row.attr('data-state', self.findingStateFor(rank, dismissed, thresholdRank));
+                    $button.text(dismissed ? 'Restore' : 'Dismiss').prop('disabled', false);
+                    self.applyFindingFilters($section);
+                }, function(err) {
+                    $button.prop('disabled', false);
+                    self.showNotice((err && err.message) || atomicedgeAdmin.strings.error, 'error');
+                });
+            });
+        },
+
+        /**
          * Run malware scan
          */
         runScan: function() {
@@ -1106,7 +1319,6 @@
             var $logLines = $logSection.find('.atomicedge-scan-log-lines');
             var $progressText = $progress.find('.atomicedge-progress-text');
 
-            var hasRealProgress = false;
             var lastDisplayedProgress = 0;
 
             if (!this.state.scan) {
@@ -1118,6 +1330,8 @@
             this.state.scan.progressInterval = null;
             this.state.scan.timeBudget = 0;
             this.state.scan.gatewayRetries = 0;
+            this.state.scan.lastWork = null;
+            this.state.scan.lastWorkAt = Date.now();
 
             $button.prop('disabled', true);
             $cancelButton.prop('disabled', false);
@@ -1127,16 +1341,9 @@
             $logSection.show();
             $logLines.text('');
 
-            // Animate progress bar until we get real progress values.
             var $progressFill = $progress.find('.atomicedge-progress-fill');
             $progressFill.css('width', '0%');
-            
-            var progress = 0;
-            var progressInterval = setInterval(function() {
-                progress = Math.min(progress + Math.random() * 10, 90);
-                lastDisplayedProgress = Math.max(lastDisplayedProgress, progress);
-                $progressFill.css('width', lastDisplayedProgress + '%');
-            }, 500);
+            var progressInterval = null;
 
             this.state.scan.progressInterval = progressInterval;
 
@@ -1150,11 +1357,6 @@
                 if (stepData.progress !== undefined) {
                     var p = parseInt(stepData.progress, 10);
                     if (!isNaN(p)) {
-                        if (!hasRealProgress) {
-                            hasRealProgress = true;
-                            clearInterval(progressInterval);
-                        }
-
                         p = Math.min(Math.max(p, 0), 100);
                         lastDisplayedProgress = Math.max(lastDisplayedProgress, p);
                         $progressFill.css('width', lastDisplayedProgress + '%');
@@ -1180,11 +1382,18 @@
                     parts.push('Files: ' + scannedCount + '/' + totalCount);
                     parts.push('Remaining: ' + remainingCount);
                 }
+                var counts = stepData.queue_counts;
+                if (counts) {
+                    if (stepData.discovery_complete === false) {
+                        parts.push('Discovering: ' + (counts.directories_remaining || 0) + ' directories left');
+                    }
+                    parts.push('Queue: ' + counts.pending + ' pending, ' + counts.processing + ' claimed, ' + counts.done + ' done');
+                }
                 if (currentItem && currentItem.path) {
                     parts.push('Now: ' + currentItem.path);
                 }
                 if (stepData.eta_label) {
-                    parts.push('ETA: ' + stepData.eta_label);
+                    parts.push('ETA: ' + stepData.eta_label + (stepData.discovery_complete === false ? ' (estimate, discovery ongoing)' : ''));
                 } else if (scanStats && scanStats.files_total) {
                     parts.push('ETA: calculating...');
                 }
@@ -1201,6 +1410,17 @@
                 }
             };
 
+            var stopPolling = function(message) {
+                clearInterval(progressInterval);
+                clearTimeout(self.state.scan.pollTimeout);
+                $button.prop('disabled', false);
+                $cancelButton.prop('disabled', false);
+                $resetButton.prop('disabled', false);
+                $progressText.text(message);
+                $logLines.text($logLines.text() + '\n' + message);
+                self.showNotice(message, 'error');
+            };
+
             var pollStep = function() {
                 if (self.state.scan && self.state.scan.cancelled) {
                     return;
@@ -1214,6 +1434,10 @@
                     }
                     renderStatus(stepData);
 
+                    if (!stepData || ['running', 'complete'].indexOf(stepData.status) === -1) {
+                        stopPolling((stepData && (stepData.error || stepData.message)) || 'Scan is no longer running. Start a new scan.');
+                        return;
+                    }
                     if (stepData && stepData.status === 'complete') {
                         clearInterval(progressInterval);
                         lastDisplayedProgress = 100;
@@ -1229,6 +1453,18 @@
                         return;
                     }
 
+                    var counts = stepData.queue_counts || {};
+                    var stats = stepData.results && stepData.results.scan_stats || {};
+                    var work = JSON.stringify([stepData.stage, stepData.core_offset, stepData.integrity_offset, stepData.discovery_cursor,
+                        counts.total, counts.done, stats.files_scanned]);
+                    if (work !== self.state.scan.lastWork) {
+                        self.state.scan.lastWork = work;
+                        self.state.scan.lastWorkAt = Date.now();
+                    } else if (Date.now() - self.state.scan.lastWorkAt >= 180000) {
+                        stopPolling('No scan progress for three minutes. Automatic scanning paused; run the scan again to resume, or inspect the server error/resource logs.');
+                        return;
+                    }
+
                     // Adaptive polling: wait a fraction of the server's time budget.
                     // For short budgets (5s), poll quickly (300ms).
                     // For longer budgets (20s), poll less frequently (800ms).
@@ -1240,19 +1476,17 @@
                     var isGatewayTimeout = status === 0 || status === 502 || status === 503 || status === 504;
                     if (isGatewayTimeout && self.state.scan && !self.state.scan.cancelled) {
                         self.state.scan.gatewayRetries = (self.state.scan.gatewayRetries || 0) + 1;
+                        if (self.state.scan.gatewayRetries > 5) {
+                            stopPolling('Repeated connection failures. Automatic scanning paused; run the scan again to resume. Check the server error/resource logs.');
+                            return;
+                        }
                         self.state.scan.timeBudget = 4;
                         $progressText.text('Connection timed out while scanning. Retrying with smaller steps...');
                         self.state.scan.pollTimeout = setTimeout(pollStep, Math.min(15000, 3000 * self.state.scan.gatewayRetries));
                         return;
                     }
 
-                    clearInterval(progressInterval);
-                    $progress.hide();
-                    $logSection.hide();
-                    $button.prop('disabled', false);
-                    $cancelButton.prop('disabled', true);
-                    $resetButton.prop('disabled', false);
-                    alert((err && err.message) ? err.message : atomicedgeAdmin.strings.error);
+                    stopPolling((err && err.message) ? err.message : atomicedgeAdmin.strings.error);
                 });
             };
 
@@ -1398,6 +1632,7 @@
                 url: atomicedgeAdmin.ajaxUrl,
                 type: 'POST',
                 data: data,
+                timeout: action === 'atomicedge_scan_step' ? 60000 : 0,
                 success: function(response) {
                     // Transparent nonce refresh: if the server flags a nonce
                     // error and this is not already a retry, fetch a fresh
